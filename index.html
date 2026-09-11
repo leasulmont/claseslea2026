@@ -113,6 +113,11 @@
   .msg ul{margin-top:.5rem;padding-left:1rem;list-style:disc}
   .acciones{display:flex;flex-wrap:wrap;gap:.75rem;align-items:center;margin-top:1rem}
   .oculto{display:none}
+
+  .envios-lista li{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem .75rem;padding:.5rem 0;border-top:1px solid var(--stone-200)}
+  .envios-lista li:first-child{border-top:none}
+  .pastilla{display:inline-block;font-size:.75rem;border-radius:999px;padding:.125rem .625rem;border:1px solid var(--stone-300);background:var(--stone-50);color:var(--stone-600)}
+  .pastilla.enviada{border-color:var(--emerald-300);background:var(--emerald-50);color:var(--emerald-800)}
 </style>
 </head>
 <body>
@@ -126,20 +131,17 @@
    Traducción a HTML+JS vainilla del artefacto React de Claude.
    Sin dependencias, sin build, sin CDN.
 
-   Piezas traducidas desde React:
-   · useState (estado, borradores, vista, foco, envío) → objetos de módulo + render() manual.
-   · useEffect de hidratación → carga inicial desde localStorage.
-   · useEffect de guardado con debounce 600 ms → guardarConDebounce().
-   · useEffect de consolidación de reflexiones (900 ms) → consolidarReflexiones().
-   · useEffect de línea de tiempo → registrarLinea(), llamado tras cada calificación.
-   · useMemo (resumen, prioridades) → funciones puras calcResumen() / calcPrioridades().
-   · onClick / onChange → delegación de eventos con atributos data-accion.
-   · window.storage (API de artefactos) → localStorage, solo como respaldo del borrador.
+   ENVÍO POR FICHA (cambio respecto de la versión anterior):
+   cada ficha se envía por separado, con su propia fecha, y se puede
+   reenviar cuantas veces haga falta. Ya no se exige tener las tres
+   fichas completas para poder reportar avance.
+   El receptor correspondiente es apps-script-avance-por-ficha.gs,
+   que escribe una fila por ficha enviada en la pestaña «avances».
    ============================================================ */
 
-/* ---------- CONFIGURACIÓN: única línea que cambia tras la Fase 3 ---------- */
-const ENDPOINT = "https://script.google.com/macros/s/AKfycbz9z3E-9RqlwIIl25nWumqDTqwwzcWuFH2MgJeKaa0dL7wRl67AcLjX4gsPBSj02kXRiA/exec"; // ← paso 3
-/* ------------------------------------------------------------------------ */
+/* ---------- CONFIGURACIÓN ---------- */
+const ENDPOINT = "https://script.google.com/macros/s/AKfycbz9z3E-9RqlwIIl25nWumqDTqwwzcWuFH2MgJeKaa0dL7wRl67AcLjX4gsPBSj02kXRiA/exec";
+/* ---------------------------------- */
 
 const CLAVE = "bitacora:estado";
 const ORDEN_NIVEL = {
@@ -390,7 +392,7 @@ const ESTADO_VACIO = {
   reflexiones: {},
   historial: {},
   linea: [],
-  enviado: null,
+  envios: {},
 };
 
 const formatoLima = new Intl.DateTimeFormat("es-PE", {
@@ -440,9 +442,14 @@ let vista = { tipo: "tablero" };
 let foco = null;
 let confirmando = false;
 let guardado = "";
-let envio = { fase: "normal", mensaje: "", faltantes: [] };
+let envio = { fase: "normal", ficha: null, mensaje: "", faltantes: [], confirmarIgual: false };
 let tGuardado = null;
 let tReflexion = null;
+
+function limpiarEnvio() {
+  if (envio.fase === "normal" && !envio.faltantes.length) return;
+  envio = { fase: "normal", ficha: null, mensaje: "", faltantes: [], confirmarIgual: false };
+}
 
 /* ---------- persistencia local (respaldo del borrador) ---------- */
 
@@ -454,6 +461,7 @@ function cargar() {
   } catch { datos = null; }
   if (datos && typeof datos === "object") {
     estado = Object.assign({}, ESTADO_VACIO, datos);
+    if (!estado.envios || typeof estado.envios !== "object") estado.envios = {};
     borradores = {};
     Object.entries(estado.reflexiones || {}).forEach(([k, v]) => {
       borradores[k] = (v && v.texto) || "";
@@ -605,7 +613,7 @@ function htmlCabecera() {
   return `
     <div style="max-width:36rem">
       <h1>Bitácora de avance — Fichas de trabajo</h1>
-      <p class="sub">Registra dónde estás en cada ficha, decide qué ajustar primero y envía tu registro cuando lo tengas completo.</p>
+      <p class="sub">Registra dónde estás en cada ficha y decide qué ajustar primero. Cada ficha se envía por separado, cuando la tengas lista, y puedes reenviarla cada vez que avances.</p>
     </div>
     <div class="der">
       ${vista.tipo !== "tablero" ? `<button data-accion="ir-tablero">Volver al tablero</button>` : ""}
@@ -622,7 +630,7 @@ function htmlTablero(resumen, prioridades, totalGlobal, totalCalificados) {
       <label for="nombre"><strong>Tu nombre completo</strong></label>
       <input id="nombre" type="text" data-campo="nombre" value="${esc(estado.nombre)}"
              placeholder="Escribe tu nombre aquí…" autocomplete="name">
-      <p class="mini" style="margin-top:.5rem">Se envía junto con tu registro para que tu docente pueda identificarlo.</p>
+      <p class="mini" style="margin-top:.5rem">Se envía junto con cada ficha para que tu docente pueda identificarla. Escríbelo siempre igual.</p>
     </section>
 
     <div class="apilado">${htmlProximoAjuste(prioridades, totalCalificados)}</div>
@@ -638,14 +646,14 @@ function htmlTablero(resumen, prioridades, totalGlobal, totalCalificados) {
       <span style="color:var(--teal-800);flex:none">Abrir</span>
     </button>
 
-    ${htmlEnvio(totalGlobal, totalCalificados)}
+    ${htmlEstadoEnvios()}
 
     <section class="nota" style="margin-top:2rem">
-      <p class="chico">Estos puntajes son de autopercepción: no son la calificación del curso. Mientras trabajas, todo se guarda solo en este navegador; se envía a tu docente únicamente cuando pulsas «Enviar mi registro».</p>
+      <p class="chico">Estos puntajes son de autopercepción: no son la calificación del curso. Mientras trabajas, todo se guarda solo en este navegador; cada ficha llega a tu docente únicamente cuando pulsas el botón de envío dentro de esa ficha.</p>
       <p class="mini" style="margin-top:.75rem">Puntaje total registrado: ${totalGlobal} de 48 · ${totalCalificados} de 24 criterios calificados</p>
       <div class="acciones">
         ${confirmando
-          ? `<span class="chico">Se borran calificaciones, evidencias, reflexiones e historial. No se puede deshacer.</span>
+          ? `<span class="chico">Se borran calificaciones, evidencias, reflexiones, historial y el registro de envíos de este navegador. Lo que ya llegó a la hoja del curso no se borra. No se puede deshacer.</span>
              <button class="btn-peligro" data-accion="reiniciar-si">Sí, borrar todo</button>
              <button data-accion="reiniciar-no">Cancelar</button>`
           : `<button data-accion="reiniciar-pedir">Reiniciar la bitácora</button>`}
@@ -658,7 +666,7 @@ function htmlProximoAjuste(prioridades, totalCalificados) {
   if (totalCalificados === 0) {
     return `<section class="franja">
       <h2>Tu próximo ajuste</h2>
-      <p class="pista">Todavía no has calificado ningún criterio, así que aún no hay nada que priorizar. Empieza por la Ficha 1: califica sus ocho criterios y esta franja te dirá cuál atacar primero.</p>
+      <p class="pista">Todavía no has calificado ningún criterio, así que aún no hay nada que priorizar. Empieza por la ficha que tengas más avanzada: no hace falta seguir el orden ni terminar las tres.</p>
       <div class="acciones"><button class="btn-principal" data-accion="ir-criterio" data-ficha="1" data-crit="1">Empezar por la Ficha 1</button></div>
     </section>`;
   }
@@ -689,12 +697,17 @@ function htmlProximoAjuste(prioridades, totalCalificados) {
 function htmlTarjetaFicha(d) {
   const s = semaforoDe(d.puntaje, d.calificados);
   const pct = Math.round((d.calificados / 8) * 100);
+  const previos = enviosDe(d.ficha.id);
+  const ultimo = previos[previos.length - 1];
   return `<article class="tarjeta" style="display:flex;flex-direction:column">
     <div class="fila-baseline">
       <h3 style="font-size:1rem;line-height:1.35">Ficha ${d.ficha.id}. ${esc(d.ficha.nombre)}</h3>
       <span class="mini">${esc(d.ficha.peso)}</span>
     </div>
-    <div style="margin-top:1.25rem">
+    <div style="margin-top:.75rem">
+      <span class="pastilla ${ultimo ? "enviada" : ""}">${ultimo ? `Enviada · ${fechaLima(ultimo.ts)}` : "Sin enviar"}</span>
+    </div>
+    <div style="margin-top:1rem">
       <p class="mini">Avance de registro</p>
       <div class="fila-barra">
         <span class="barra"><span style="width:${pct}%"></span></span>
@@ -713,6 +726,7 @@ function htmlTarjetaFicha(d) {
     <dl class="mini" style="margin:1rem 0 0">
       <div style="display:flex;justify-content:space-between;gap:.5rem"><dt>Reflexiones respondidas</dt><dd class="num" style="margin:0">${d.reflexiones}/4</dd></div>
       <div style="display:flex;justify-content:space-between;gap:.5rem;margin-top:.25rem"><dt>Criterios en 2 sin evidencia anotada</dt><dd class="num" style="margin:0">${d.dosSinEvidencia}</dd></div>
+      <div style="display:flex;justify-content:space-between;gap:.5rem;margin-top:.25rem"><dt>Envíos de esta ficha</dt><dd class="num" style="margin:0">${previos.length}</dd></div>
     </dl>
     <div style="margin-top:1.25rem">
       <button style="width:100%;background:var(--stone-50)" data-accion="abrir-ficha" data-ficha="${d.ficha.id}">
@@ -722,43 +736,28 @@ function htmlTarjetaFicha(d) {
   </article>`;
 }
 
-/* ----- envío ----- */
+/* ----- envíos: estado general en el tablero ----- */
 
-function htmlEnvio(totalGlobal, totalCalificados) {
-  const faltantes = validar();
-  let cuerpo = "";
-  if (envio.fase === "exito") {
-    cuerpo = `<div class="msg msg-ok" role="status">${esc(envio.mensaje)}</div>`;
-  } else if (envio.fase === "error") {
-    cuerpo = `<div class="msg msg-error" role="alert">${esc(envio.mensaje)}</div>`;
-  } else if (envio.faltantes.length) {
-    cuerpo = `<div class="msg msg-info" role="alert">
-      Falta completar ${envio.faltantes.length} elemento(s) antes de enviar:
-      <ul>${envio.faltantes.slice(0, 6).map((f) => `<li>${esc(f.etiqueta)}</li>`).join("")}
-      ${envio.faltantes.length > 6 ? `<li>… y ${envio.faltantes.length - 6} más</li>` : ""}</ul>
-    </div>`;
-  }
-  return `<section class="tarjeta apilado" id="envio">
-    <h2 style="font-size:1.125rem">Enviar mi registro</h2>
-    <p class="chico" style="margin-top:.5rem;max-width:42rem">Se envía una sola fila con tu nombre, los 24 puntajes, las evidencias anotadas, las 12 respuestas de reflexión y tus totales. Puedes seguir trabajando después de enviar; si vuelves a enviar, se agrega una fila nueva.</p>
-    <p class="mini" style="margin-top:.5rem">Listo para enviar: ${totalCalificados}/24 criterios · ${contarReflexiones()}/12 reflexiones · ${totalGlobal}/48 puntos${estado.enviado ? ` · último envío: ${fechaLima(estado.enviado)}` : ""}</p>
-    <div class="acciones">
-      <button class="btn-principal" id="btn-enviar" data-accion="enviar" ${envio.fase === "enviando" ? "disabled" : ""}>
-        ${envio.fase === "enviando" ? "Enviando…" : faltantes.length ? "Revisar y enviar" : "Enviar mis datos"}
-      </button>
-      ${envio.faltantes.length ? `<button data-accion="ir-faltante">Ir a lo que falta</button>` : ""}
-    </div>
-    <div aria-live="polite">${cuerpo}</div>
-  </section>`;
+function enviosDe(fid) {
+  return (estado.envios && estado.envios[fid]) || [];
 }
 
-function contarReflexiones() {
-  let n = 0;
-  FICHAS.forEach((f) => preguntasDe(f.id).forEach((_, i) => {
-    const r = estado.reflexiones[kr(f.id, i)];
-    if (r && r.texto) n += 1;
-  }));
-  return n;
+function htmlEstadoEnvios() {
+  return `<section class="tarjeta apilado">
+    <h2 style="font-size:1.125rem">Envíos por ficha</h2>
+    <p class="chico" style="margin-top:.5rem;max-width:42rem">No hace falta terminar las tres fichas para reportar. Cada ficha se envía por su cuenta desde su propia pantalla, y cada vez que avances puedes volver a enviarla: tu docente verá el historial de cómo fue cambiando.</p>
+    <ul class="envios-lista" style="margin-top:1rem">
+      ${FICHAS.map((f) => {
+        const previos = enviosDe(f.id);
+        const ultimo = previos[previos.length - 1];
+        return `<li>
+          <span class="chico" style="flex:1;min-width:12rem">Ficha ${f.id}. ${esc(f.nombre)}</span>
+          <span class="mini">${ultimo ? `Último envío: ${fechaLima(ultimo.ts)} · envío ${ultimo.envio}` : "Todavía sin enviar"}</span>
+          <button data-accion="abrir-ficha" data-ficha="${f.id}">${ultimo ? "Revisar y reenviar" : "Ir a enviar"}</button>
+        </li>`;
+      }).join("")}
+    </ul>
+  </section>`;
 }
 
 /* ----- vista de ficha ----- */
@@ -804,7 +803,7 @@ function htmlFicha(ficha, prioridades) {
 
     <section style="margin-top:2.5rem">
       <h3 style="font-size:1.125rem">Preguntas de reflexión</h3>
-      <p class="chico" style="margin-top:.25rem">Se guardan solas mientras escribes. Cada versión queda con su fecha en la Bitácora.</p>
+      <p class="chico" style="margin-top:.25rem">Se guardan solas mientras escribes y viajan con esta ficha cuando la envías. Cada versión queda con su fecha en la Bitácora.</p>
       <div class="lista-reflexion" style="margin-top:1rem">
         ${preguntas.map((p, i) => {
           const clave = kr(ficha.id, i);
@@ -817,7 +816,56 @@ function htmlFicha(ficha, prioridades) {
         }).join("")}
       </div>
     </section>
+
+    ${htmlEnvioFicha(ficha, calificados, puntaje)}
   </main>`;
+}
+
+function htmlEnvioFicha(ficha, calificados, puntaje) {
+  const fid = ficha.id;
+  const previos = enviosDe(fid);
+  const ultimo = previos[previos.length - 1];
+  const faltantes = validarFicha(fid);
+  const mio = envio.ficha === fid;
+
+  let cuerpo = "";
+  if (mio && envio.fase === "exito") {
+    cuerpo = `<div class="msg msg-ok" role="status">${esc(envio.mensaje)}</div>`;
+  } else if (mio && envio.fase === "error") {
+    cuerpo = `<div class="msg msg-error" role="alert">${esc(envio.mensaje)}</div>`;
+  } else if (mio && envio.fase === "igual") {
+    cuerpo = `<div class="msg msg-info" role="alert">${esc(envio.mensaje)}</div>`;
+  } else if (mio && envio.faltantes.length) {
+    cuerpo = `<div class="msg msg-info" role="alert">
+      Falta completar esto antes de enviar la Ficha ${fid}:
+      <ul>${envio.faltantes.slice(0, 8).map((f) => `<li>${esc(f.etiqueta)}</li>`).join("")}</ul>
+    </div>`;
+  }
+
+  let etiquetaBoton;
+  if (mio && envio.fase === "enviando") etiquetaBoton = "Enviando…";
+  else if (faltantes.length) etiquetaBoton = "Revisar y enviar esta ficha";
+  else if (mio && envio.fase === "igual") etiquetaBoton = "Enviar igual";
+  else if (ultimo) etiquetaBoton = "Reenviar avance actualizado";
+  else etiquetaBoton = `Enviar avance de la Ficha ${fid}`;
+
+  return `<section class="tarjeta" style="margin-top:2rem" id="envio-${fid}">
+    <h2 style="font-size:1.125rem">Enviar el avance de esta ficha</h2>
+    <p class="chico" style="margin-top:.5rem;max-width:42rem">Se envía solo esta ficha: tu nombre, sus 8 puntajes, las evidencias anotadas y sus 4 reflexiones. Las otras dos fichas no se tocan. Puedes volver a enviarla cuantas veces avances; cada envío queda registrado con su fecha.</p>
+    <p class="mini" style="margin-top:.5rem">Estado: ${calificados}/8 criterios calificados · ${puntaje}/16 puntos · ${reflexionesRespondidas(fid)}/4 reflexiones${ultimo ? ` · último envío: ${fechaLima(ultimo.ts)} (envío ${ultimo.envio})` : " · sin enviar todavía"}</p>
+    <div class="acciones">
+      <button class="btn-principal" data-accion="enviar-ficha" data-ficha="${fid}" ${mio && envio.fase === "enviando" ? "disabled" : ""}>${etiquetaBoton}</button>
+      ${mio && envio.faltantes.length ? `<button data-accion="ir-faltante">Ir a lo que falta</button>` : ""}
+    </div>
+    <div aria-live="polite">${cuerpo}</div>
+    ${previos.length > 1 ? `<details style="margin-top:1rem"><summary>Envíos anteriores de esta ficha (${previos.length - 1})</summary>
+      <ul>${previos.slice(0, -1).reverse().map((e) => `<li class="version-previa">Envío ${e.envio} · ${fechaLima(e.ts)}${typeof e.subtotal === "number" ? ` · ${e.subtotal}/16 puntos` : ""}</li>`).join("")}</ul>
+    </details>` : ""}
+  </section>`;
+}
+
+function reflexionesRespondidas(fid) {
+  return preguntasDe(fid).reduce((acc, _, i) => acc + (textoReflexion(kr(fid, i)) ? 1 : 0), 0);
 }
 
 function htmlCriterio(ficha, c) {
@@ -894,27 +942,46 @@ function htmlBitacora() {
   </main>`;
 }
 
-/* ---------- validación de envío ---------- */
+/* ---------- validación y envío por ficha ---------- */
 
-function validar() {
+function textoReflexion(clave) {
+  const b = borradores[clave];
+  if (b != null && b.trim()) return b.trim();
+  const r = estado.reflexiones[clave];
+  return r && r.texto ? r.texto : "";
+}
+
+function validarFicha(fid) {
   const faltantes = [];
-  if (!(estado.nombre || "").trim() || (estado.nombre || "").trim().length < 2) {
-    faltantes.push({ tipo: "nombre", etiqueta: "Tu nombre completo" });
+  if ((estado.nombre || "").trim().length < 3) {
+    faltantes.push({ tipo: "nombre", etiqueta: "Tu nombre completo (en el tablero)" });
   }
-  FICHAS.forEach((f) => f.criterios.forEach((c) => {
-    const v = estado.calificaciones[kc(f.id, c.n)];
+  const f = FICHAS.find((x) => x.id === fid);
+  f.criterios.forEach((c) => {
+    const v = estado.calificaciones[kc(fid, c.n)];
     if (v !== 0 && v !== 1 && v !== 2) {
-      faltantes.push({ tipo: "criterio", ficha: f.id, crit: c.n, etiqueta: `Ficha ${f.id}, criterio ${c.n} sin calificar` });
+      faltantes.push({ tipo: "criterio", ficha: fid, crit: c.n, etiqueta: `Criterio ${c.n} sin calificar` });
     }
-  }));
-  FICHAS.forEach((f) => preguntasDe(f.id).forEach((_, i) => {
-    const clave = kr(f.id, i);
-    const texto = ((borradores[clave] != null ? borradores[clave] : (estado.reflexiones[clave] || {}).texto) || "").trim();
-    if (texto.length < 15) {
-      faltantes.push({ tipo: "reflexion", ficha: f.id, indice: i, clave, etiqueta: `Ficha ${f.id}, pregunta de reflexión ${i + 1} sin responder (mínimo 15 caracteres)` });
-    }
-  }));
+  });
   return faltantes;
+}
+
+function datosParaEnviarFicha(fid) {
+  const f = FICHAS.find((x) => x.id === fid);
+  return {
+    nombre: (estado.nombre || "").trim(),
+    ficha: fid,
+    puntajes: f.criterios.map((c) => {
+      const v = estado.calificaciones[kc(fid, c.n)];
+      return (v === 0 || v === 1 || v === 2) ? v : null;
+    }),
+    evidencias: f.criterios.map((c) => (estado.evidencias[kc(fid, c.n)] || "").trim()),
+    reflexiones: preguntasDe(fid).map((_, i) => textoReflexion(kr(fid, i))),
+  };
+}
+
+function firmaFicha(fid) {
+  return JSON.stringify(datosParaEnviarFicha(fid));
 }
 
 function irAFaltante(f) {
@@ -930,80 +997,67 @@ function irAFaltante(f) {
   vista = { tipo: "ficha", id: f.ficha };
   foco = f.tipo === "criterio" ? kc(f.ficha, f.crit) : f.clave;
   render();
-  if (f.tipo === "reflexion") {
-    const el = document.getElementById(f.clave);
-    if (el) { el.classList.add("invalido"); el.focus(); }
-  }
 }
 
-/* ---------- envío ---------- */
-
-function datosParaEnviar() {
-  const d = {};
-  d.nombre_estudiante = (estado.nombre || "").trim();
-  let total = 0, calificados = 0;
-  FICHAS.forEach((f) => {
-    let pf = 0;
-    f.criterios.forEach((c) => {
-      const clave = kc(f.id, c.n);
-      const v = estado.calificaciones[clave];
-      d[`puntaje_${clave}`] = String(v);
-      d[`evidencia_${clave}`] = (estado.evidencias[clave] || "").trim();
-      pf += v; calificados += 1;
-    });
-    d[`puntaje_f${f.id}`] = String(pf);
-    total += pf;
-  });
-  FICHAS.forEach((f) => preguntasDe(f.id).forEach((_, i) => {
-    const clave = kr(f.id, i);
-    const r = estado.reflexiones[clave];
-    d[`reflexion_${clave}`] = ((borradores[clave] != null && borradores[clave].trim()) ? borradores[clave] : (r ? r.texto : "")).trim();
-  }));
-  d.puntaje_total = String(total);
-  d.criterios_calificados = String(calificados);
-  const prioridades = calcPrioridades();
-  if (prioridades.length) {
-    const p = prioridades[0];
-    d.prioridad_ajuste = `F${p.ficha.id}-C${p.criterio.n} (marcado en ${p.valor}, ${ETIQUETA_NIVEL[p.criterio.nivel]}): ${p.criterio.texto}`.slice(0, 300);
-  } else {
-    d.prioridad_ajuste = "Sin ajustes pendientes: los 24 criterios están en 2.";
-  }
-  return d;
-}
-
-async function enviar() {
-  const faltantes = validar();
+async function enviarFicha(fid) {
+  const faltantes = validarFicha(fid);
   if (faltantes.length) {
-    envio = { fase: "normal", mensaje: "", faltantes };
+    envio = { fase: "normal", ficha: fid, mensaje: "", faltantes, confirmarIgual: false };
     render();
     irAFaltante(faltantes[0]);
     return;
   }
-  if (ENDPOINT.indexOf("PEGAR_AQUI") === 0) {
-    envio = { fase: "error", mensaje: "Falta configurar la dirección de envío (ENDPOINT) en el código. Avisa a tu docente.", faltantes: [] };
+
+  const previos = enviosDe(fid);
+  const ultimo = previos[previos.length - 1];
+  if (ultimo && ultimo.firma === firmaFicha(fid) && !envio.confirmarIgual) {
+    envio = {
+      fase: "igual", ficha: fid, faltantes: [], confirmarIgual: true,
+      mensaje: `Esta ficha no ha cambiado desde tu envío del ${fechaLima(ultimo.ts)}. Si igual quieres dejar constancia hoy, vuelve a pulsar el botón.`,
+    };
     render();
     return;
   }
-  envio = { fase: "enviando", mensaje: "", faltantes: [] };
+
+  envio = { fase: "enviando", ficha: fid, mensaje: "", faltantes: [], confirmarIgual: false };
   render();
+
   try {
     const respuesta = await fetch(ENDPOINT, {
       method: "POST",
-      body: new URLSearchParams(datosParaEnviar()),
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify(datosParaEnviarFicha(fid)),
     });
     const json = await respuesta.json();
     if (json && json.ok) {
-      estado.enviado = new Date().toISOString();
+      const registro = {
+        ts: new Date().toISOString(),
+        envio: json.envio || previos.length + 1,
+        subtotal: json.subtotal,
+        firma: firmaFicha(fid),
+      };
+      if (!estado.envios) estado.envios = {};
+      estado.envios[fid] = [...previos, registro].slice(-20);
       guardarConDebounce();
-      envio = { fase: "exito", mensaje: `Registro enviado (${fechaLima(estado.enviado)}). Tu docente ya lo tiene. Puedes cerrar esta página o seguir trabajando.`, faltantes: [] };
+      envio = {
+        fase: "exito", ficha: fid, faltantes: [], confirmarIgual: false,
+        mensaje: `Ficha ${fid} enviada el ${fechaLima(registro.ts)} (envío ${registro.envio}). Puedes seguir trabajando y reenviarla cuando avances.`,
+      };
     } else {
-      envio = { fase: "error", mensaje: `No se pudo registrar: ${(json && json.msg) || "respuesta inesperada del servidor"}. Tus datos siguen guardados aquí; vuelve a intentarlo.`, faltantes: [] };
+      envio = {
+        fase: "error", ficha: fid, faltantes: [], confirmarIgual: false,
+        mensaje: `No se pudo registrar: ${(json && (json.error || json.msg)) || "respuesta inesperada del servidor"}. Tus datos siguen guardados en este navegador.`,
+      };
     }
   } catch (e) {
-    envio = { fase: "error", mensaje: "No se pudo enviar (revisa tu conexión). Nada de lo que escribiste se perdió: sigue guardado en este navegador. Intenta de nuevo en unos minutos.", faltantes: [] };
+    envio = {
+      fase: "error", ficha: fid, faltantes: [], confirmarIgual: false,
+      mensaje: "No se pudo enviar (revisa tu conexión). Nada de lo que escribiste se perdió: sigue guardado en este navegador. Intenta de nuevo en unos minutos.",
+    };
   }
+
   render();
-  const el = document.getElementById("envio");
+  const el = document.getElementById("envio-" + fid);
   if (el && el.scrollIntoView) el.scrollIntoView({ behavior: "smooth", block: "center" });
 }
 
@@ -1016,17 +1070,17 @@ document.addEventListener("click", (ev) => {
   const ficha = Number(b.getAttribute("data-ficha"));
   const crit = Number(b.getAttribute("data-crit"));
 
-  if (a === "ir-tablero") { vista = { tipo: "tablero" }; foco = null; render(); }
-  else if (a === "abrir-ficha") { vista = { tipo: "ficha", id: ficha }; foco = null; render(); }
-  else if (a === "abrir-bitacora") { vista = { tipo: "bitacora" }; foco = null; render(); }
-  else if (a === "ir-criterio") { vista = { tipo: "ficha", id: ficha }; foco = kc(ficha, crit); render(); }
+  if (a === "ir-tablero") { vista = { tipo: "tablero" }; foco = null; limpiarEnvio(); render(); }
+  else if (a === "abrir-ficha") { vista = { tipo: "ficha", id: ficha }; foco = null; limpiarEnvio(); render(); }
+  else if (a === "abrir-bitacora") { vista = { tipo: "bitacora" }; foco = null; limpiarEnvio(); render(); }
+  else if (a === "ir-criterio") { vista = { tipo: "ficha", id: ficha }; foco = kc(ficha, crit); limpiarEnvio(); render(); }
   else if (a === "reiniciar-pedir") { confirmando = true; render(); }
   else if (a === "reiniciar-no") { confirmando = false; render(); }
   else if (a === "reiniciar-si") {
     try { localStorage.removeItem(CLAVE); } catch {}
     estado = JSON.parse(JSON.stringify(ESTADO_VACIO));
     borradores = {}; confirmando = false; foco = null;
-    envio = { fase: "normal", mensaje: "", faltantes: [] };
+    envio = { fase: "normal", ficha: null, mensaje: "", faltantes: [], confirmarIgual: false };
     vista = { tipo: "tablero" };
     render();
   }
@@ -1038,12 +1092,13 @@ document.addEventListener("click", (ev) => {
     const total = calcResumen().reduce((s, r) => s + r.puntaje, 0);
     registrarLinea(total);
     guardarConDebounce();
+    limpiarEnvio();
     foco = clave;
     render();
     const activo = document.querySelector(`#${clave} [data-valor="${valor}"]`);
     if (activo) activo.focus();
   }
-  else if (a === "enviar") enviar();
+  else if (a === "enviar-ficha") enviarFicha(ficha);
   else if (a === "ir-faltante") irAFaltante(envio.faltantes[0]);
 });
 
@@ -1062,6 +1117,9 @@ document.addEventListener("input", (ev) => {
     borradores[ev.target.getAttribute("data-clave")] = ev.target.value;
     guardarConDebounce();
     consolidarReflexiones();
+  }
+  if (envio.fase === "igual" || envio.fase === "exito") {
+    envio = { fase: "normal", ficha: null, mensaje: "", faltantes: [], confirmarIgual: false };
   }
 });
 
